@@ -1,65 +1,260 @@
-import Image from "next/image";
+'use client';
+
+import React, { useEffect, useState, useCallback } from 'react';
+import { TimerDisplay } from '@/components/TimerDisplay';
+import { TimerControls } from '@/components/TimerControls';
+import { AmbientSoundSelector } from '@/components/AmbientSoundSelector';
+import { DurationPicker } from '@/components/DurationPicker';
+import { SessionType } from '@/types';
+import {
+  sessionStorage,
+  settingsStorage,
+  getTodayDate,
+  addSessionAndUpdateStats,
+} from '@/lib/storage';
+import {
+  requestNotificationPermission,
+  sendSessionEndedNotification,
+  playNotificationSound,
+} from '@/lib/notifications';
+import { ambientSoundManager } from '@/lib/sounds';
+
+interface TimerState {
+  isRunning: boolean;
+  timeRemaining: number;
+  sessionType: SessionType;
+  workDuration: number;
+  breakDuration: number;
+  sessionsCompleted: number;
+}
 
 export default function Home() {
+  const [timer, setTimer] = useState<TimerState>({
+    isRunning: false,
+    timeRemaining: 25 * 60,
+    sessionType: 'work',
+    workDuration: 25,
+    breakDuration: 5,
+    sessionsCompleted: 0,
+  });
+
+  const [settings, setSettings] = useState(settingsStorage.get());
+  const [showDurationPicker, setShowDurationPicker] = useState(false);
+  const [notificationsPermission, setNotificationsPermission] = useState(false);
+
+  // Request notification permission on mount
+  useEffect(() => {
+    requestNotificationPermission().then(setNotificationsPermission);
+  }, []);
+
+  // Load settings and update timer
+  useEffect(() => {
+    const savedSettings = settingsStorage.get();
+    setSettings(savedSettings);
+    setTimer((prev) => ({
+      ...prev,
+      workDuration: savedSettings.workDuration,
+      breakDuration: savedSettings.breakDuration,
+      timeRemaining:
+        prev.sessionType === 'work'
+          ? savedSettings.workDuration * 60
+          : savedSettings.breakDuration * 60,
+    }));
+  }, []);
+
+  // Main timer effect
+  useEffect(() => {
+    if (!timer.isRunning) return;
+
+    const interval = setInterval(() => {
+      setTimer((prev) => {
+        const newTimeRemaining = prev.timeRemaining - 1;
+
+        if (newTimeRemaining <= 0) {
+          // Session complete
+          const completedSession = {
+            id: `${Date.now()}`,
+            type: prev.sessionType,
+            duration: prev.sessionType === 'work' ? prev.workDuration : prev.breakDuration,
+            completedAt: new Date().toISOString(),
+          };
+
+          addSessionAndUpdateStats(completedSession);
+
+          // Play notifications
+          if (settings.soundEnabled) {
+            playNotificationSound();
+          }
+          if (notificationsPermission) {
+            sendSessionEndedNotification(prev.sessionType);
+          }
+
+          // Switch to next session
+          const nextSessionType = prev.sessionType === 'work' ? 'break' : 'work';
+          const nextDuration =
+            nextSessionType === 'work' ? prev.workDuration : prev.breakDuration;
+
+          // Auto-start if enabled
+          const shouldAutoStart =
+            (nextSessionType === 'work' && settings.autoStartWork) ||
+            (nextSessionType === 'break' && settings.autoStartBreak);
+
+          return {
+            ...prev,
+            sessionType: nextSessionType,
+            timeRemaining: nextDuration * 60,
+            sessionsCompleted:
+              nextSessionType === 'work' ? prev.sessionsCompleted + 1 : prev.sessionsCompleted,
+            isRunning: shouldAutoStart,
+          };
+        }
+
+        return {
+          ...prev,
+          timeRemaining: newTimeRemaining,
+        };
+      });
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [timer.isRunning, settings, notificationsPermission]);
+
+  // Calculate progress percentage
+  const totalDuration = timer.sessionType === 'work' ? timer.workDuration : timer.breakDuration;
+  const progress = ((totalDuration * 60 - timer.timeRemaining) / (totalDuration * 60)) * 100;
+
+  const handleStart = useCallback(() => {
+    setTimer((prev) => ({ ...prev, isRunning: true }));
+    if (settings.soundEnabled && settings.ambientSound !== 'none') {
+      ambientSoundManager.play(settings.ambientSound);
+    }
+  }, [settings]);
+
+  const handlePause = useCallback(() => {
+    setTimer((prev) => ({ ...prev, isRunning: false }));
+  }, []);
+
+  const handleReset = useCallback(() => {
+    const duration =
+      timer.sessionType === 'work' ? timer.workDuration : timer.breakDuration;
+    setTimer((prev) => ({
+      ...prev,
+      isRunning: false,
+      timeRemaining: duration * 60,
+    }));
+  }, [timer.sessionType, timer.workDuration, timer.breakDuration]);
+
+  const handleNext = useCallback(() => {
+    const nextSessionType = timer.sessionType === 'work' ? 'break' : 'work';
+    const nextDuration = nextSessionType === 'work' ? timer.workDuration : timer.breakDuration;
+
+    setTimer((prev) => ({
+      ...prev,
+      isRunning: false,
+      sessionType: nextSessionType,
+      timeRemaining: nextDuration * 60,
+      sessionsCompleted:
+        nextSessionType === 'work' ? prev.sessionsCompleted + 1 : prev.sessionsCompleted,
+    }));
+  }, [timer.sessionType, timer.workDuration, timer.breakDuration]);
+
+  const handleWorkDurationChange = useCallback((duration: number) => {
+    setTimer((prev) => ({
+      ...prev,
+      workDuration: duration,
+      timeRemaining: prev.sessionType === 'work' ? duration * 60 : prev.timeRemaining,
+    }));
+    settingsStorage.set({ workDuration: duration });
+  }, []);
+
+  const handleBreakDurationChange = useCallback((duration: number) => {
+    setTimer((prev) => ({
+      ...prev,
+      breakDuration: duration,
+      timeRemaining: prev.sessionType === 'break' ? duration * 60 : prev.timeRemaining,
+    }));
+    settingsStorage.set({ breakDuration: duration });
+  }, []);
+
+  const handleSoundChange = useCallback((soundKey: string) => {
+    setSettings((prev) => ({ ...prev, ambientSound: soundKey }));
+    settingsStorage.set({ ambientSound: soundKey });
+    if (timer.isRunning && soundKey !== 'none') {
+      ambientSoundManager.play(soundKey);
+    }
+  }, [timer.isRunning]);
+
+  const handleSoundEnabledChange = useCallback((enabled: boolean) => {
+    setSettings((prev) => ({ ...prev, soundEnabled: enabled }));
+    settingsStorage.set({ soundEnabled: enabled });
+  }, []);
+
   return (
-    <div className="flex flex-col flex-1 items-center justify-center bg-zinc-50 font-sans dark:bg-black">
-      <main className="flex flex-1 w-full max-w-3xl flex-col items-center justify-between py-32 px-16 bg-white dark:bg-black sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={100}
-          height={20}
-          priority
-        />
-        <div className="flex flex-col items-center gap-6 text-center sm:items-start sm:text-left">
-          <h1 className="max-w-xs text-3xl font-semibold leading-10 tracking-tight text-black dark:text-zinc-50">
-            To get started, edit the page.tsx file.
-          </h1>
-          <p className="max-w-md text-lg leading-8 text-zinc-600 dark:text-zinc-400">
-            Looking for a starting point or more instructions? Head over to{" "}
-            <a
-              href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Templates
-            </a>{" "}
-            or the{" "}
-            <a
-              href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-              className="font-medium text-zinc-950 dark:text-zinc-50"
-            >
-              Learning
-            </a>{" "}
-            center.
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100 dark:from-gray-950 dark:to-gray-900">
+      <div className="max-w-4xl mx-auto px-4 py-8">
+        {/* Session counter */}
+        <div className="text-center mb-8">
+          <p className="text-gray-600 dark:text-gray-400">
+            Sessions Completed Today
+          </p>
+          <p className="text-4xl font-bold text-gray-900 dark:text-white">
+            {timer.sessionsCompleted}
           </p>
         </div>
-        <div className="flex flex-col gap-4 text-base font-medium sm:flex-row">
-          <a
-            className="flex h-12 w-full items-center justify-center gap-2 rounded-full bg-foreground px-5 text-background transition-colors hover:bg-[#383838] dark:hover:bg-[#ccc] md:w-[158px]"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={16}
-              height={16}
-            />
-            Deploy Now
-          </a>
-          <a
-            className="flex h-12 w-full items-center justify-center rounded-full border border-solid border-black/[.08] px-5 transition-colors hover:border-transparent hover:bg-black/[.04] dark:border-white/[.145] dark:hover:bg-[#1a1a1a] md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Documentation
-          </a>
+
+        {/* Main Timer */}
+        <div className="mb-12">
+          <TimerDisplay
+            timeRemaining={timer.timeRemaining}
+            isRunning={timer.isRunning}
+            sessionType={timer.sessionType}
+            progress={progress}
+          />
         </div>
-      </main>
+
+        {/* Controls */}
+        <div className="mb-12">
+          <TimerControls
+            isRunning={timer.isRunning}
+            onStart={handleStart}
+            onPause={handlePause}
+            onReset={handleReset}
+            onNext={handleNext}
+          />
+        </div>
+
+        {/* Ambient Sounds */}
+        <div className="mb-8">
+          <AmbientSoundSelector
+            selectedSound={settings.ambientSound}
+            onSoundChange={handleSoundChange}
+            soundEnabled={settings.soundEnabled}
+            onSoundEnabledChange={handleSoundEnabledChange}
+          />
+        </div>
+
+        {/* Duration Picker Toggle */}
+        <div className="text-center">
+          <button
+            onClick={() => setShowDurationPicker(!showDurationPicker)}
+            className="text-blue-600 dark:text-blue-400 hover:underline text-sm font-medium"
+          >
+            {showDurationPicker ? 'Hide' : 'Show'} Duration Settings
+          </button>
+        </div>
+
+        {/* Duration Picker */}
+        {showDurationPicker && (
+          <div className="mt-8">
+            <DurationPicker
+              workDuration={timer.workDuration}
+              breakDuration={timer.breakDuration}
+              onWorkDurationChange={handleWorkDurationChange}
+              onBreakDurationChange={handleBreakDurationChange}
+            />
+          </div>
+        )}
+      </div>
     </div>
   );
 }
